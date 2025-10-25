@@ -8,6 +8,7 @@
 (define-constant ERR-INVALID-LEVEL (err u107))
 (define-constant ERR-INSUFFICIENT-LEVEL (err u108))
 (define-constant ERR-AUDIT-OVERFLOW (err u109))
+(define-constant ERR-INVALID-SCORE (err u110))
 
 (define-constant EVENT-REGISTRATION u1)
 (define-constant EVENT-REVOCATION u2)
@@ -17,6 +18,11 @@
 (define-constant LEVEL-BASIC u1)
 (define-constant LEVEL-STANDARD u2) 
 (define-constant LEVEL-PREMIUM u3)
+
+(define-constant SCORE-REGISTRATION u10)
+(define-constant SCORE-UPDATE u5)
+(define-constant SCORE-REVOCATION-PENALTY u20)
+(define-constant SCORE-EXPIRY-PENALTY u3)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var oracle-address principal tx-sender)
@@ -53,6 +59,32 @@
 (define-map user-audit-count
     principal
     uint)
+
+(define-map user-reputation-scores
+    principal
+    {score: uint,
+     positive-actions: uint,
+     negative-actions: uint,
+     last-updated: uint})
+
+(define-private (update-reputation-score (user principal) (points uint) (is-positive bool))
+    (let ((current-score (default-to {score: u0, positive-actions: u0, negative-actions: u0, last-updated: u0} 
+                                     (map-get? user-reputation-scores user)))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (if is-positive
+            (map-set user-reputation-scores user
+                {score: (+ (get score current-score) points),
+                 positive-actions: (+ (get positive-actions current-score) u1),
+                 negative-actions: (get negative-actions current-score),
+                 last-updated: (default-to u0 current-time)})
+            (map-set user-reputation-scores user
+                {score: (if (>= (get score current-score) points) 
+                           (- (get score current-score) points) 
+                           u0),
+                 positive-actions: (get positive-actions current-score),
+                 negative-actions: (+ (get negative-actions current-score) u1),
+                 last-updated: (default-to u0 current-time)}))
+        (ok true)))
 
 (define-private (log-audit-event (user principal) (event-type uint) (level uint) (details (string-ascii 256)))
     (let ((current-time (get-stacks-block-info? time (- stacks-block-height u1)))
@@ -101,6 +133,7 @@
              expiry: expiry,
              status: true,
              level: verification-level})
+        (unwrap-panic (update-reputation-score user SCORE-REGISTRATION true))
         (unwrap-panic (log-audit-event user EVENT-REGISTRATION verification-level "User registered with KYC verification"))
         (ok true)))
 
@@ -121,6 +154,7 @@
         (asserts! (is-some user-data) ERR-NOT-VERIFIED)
         (map-set verified-users user 
             (merge (unwrap-panic user-data) {status: false}))
+        (unwrap-panic (update-reputation-score user SCORE-REVOCATION-PENALTY false))
         (unwrap-panic (log-audit-event user EVENT-REVOCATION (get level (unwrap-panic user-data)) "Verification status revoked"))
         (ok true)))
 
@@ -142,6 +176,7 @@
              expiry: new-expiry,
              status: true,
              level: new-level})
+        (unwrap-panic (update-reputation-score user SCORE-UPDATE true))
         (unwrap-panic (log-audit-event user EVENT-UPDATE new-level "Verification details updated"))
         (ok true)))
 
@@ -203,4 +238,35 @@
 (define-read-only (get-audit-logs-by-user-range (user principal) (start-timestamp uint) (end-timestamp uint))
     (let ((user-count (default-to u0 (map-get? user-audit-count user))))
         (ok {user: user, count: user-count, start: start-timestamp, end: end-timestamp})))
+
+(define-read-only (get-reputation-score (user principal))
+    (ok (map-get? user-reputation-scores user)))
+
+(define-read-only (check-reputation-threshold (user principal) (minimum-score uint))
+    (let ((reputation-data (map-get? user-reputation-scores user)))
+        (match reputation-data
+            data (ok (>= (get score data) minimum-score))
+            (ok false))))
+
+(define-public (penalize-expired-verification (user principal))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (asserts! (get status (unwrap-panic user-data)) ERR-REVOKED)
+        (asserts! (<= (get expiry (unwrap-panic user-data)) 
+            (default-to u0 current-time)) ERR-INVALID-EXPIRY)
+        (unwrap-panic (update-reputation-score user SCORE-EXPIRY-PENALTY false))
+        (ok true)))
+
+(define-read-only (get-reputation-ranking (user principal))
+    (let ((reputation-data (default-to {score: u0, positive-actions: u0, negative-actions: u0, last-updated: u0} 
+                                       (map-get? user-reputation-scores user)))
+          (score (get score reputation-data)))
+        (ok (if (>= score u100)
+               "excellent"
+               (if (>= score u50)
+                   "good"
+                   (if (>= score u20)
+                       "average"
+                       "low"))))))
 
