@@ -9,6 +9,10 @@
 (define-constant ERR-INSUFFICIENT-LEVEL (err u108))
 (define-constant ERR-AUDIT-OVERFLOW (err u109))
 (define-constant ERR-INVALID-SCORE (err u110))
+(define-constant ERR-BATCH-LIMIT-EXCEEDED (err u111))
+(define-constant ERR-BATCH-EMPTY (err u112))
+
+(define-constant MAX-BATCH-SIZE u50)
 
 (define-constant EVENT-REGISTRATION u1)
 (define-constant EVENT-REVOCATION u2)
@@ -66,6 +70,16 @@
      positive-actions: uint,
      negative-actions: uint,
      last-updated: uint})
+
+(define-map batch-operations
+    uint
+    {operator: principal,
+     total-users: uint,
+     successful: uint,
+     failed: uint,
+     timestamp: uint})
+
+(define-data-var batch-counter uint u0)
 
 (define-private (update-reputation-score (user principal) (points uint) (is-positive bool))
     (let ((current-score (default-to {score: u0, positive-actions: u0, negative-actions: u0, last-updated: u0} 
@@ -269,4 +283,83 @@
                    (if (>= score u20)
                        "average"
                        "low"))))))
+
+(define-private (process-single-registration (user-entry {user: principal, proof: (buff 64), expiry: uint, level: uint}) (acc {success: uint, fail: uint}))
+    (let ((current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (user (get user user-entry))
+          (proof (get proof user-entry))
+          (expiry (get expiry user-entry))
+          (level (get level user-entry)))
+        (if (and (> expiry (default-to u0 current-time))
+                (is-none (map-get? verified-users user))
+                (or (is-eq level LEVEL-BASIC) 
+                    (or (is-eq level LEVEL-STANDARD) 
+                        (is-eq level LEVEL-PREMIUM))))
+            (begin
+                (map-set oracle-proofs proof {verified: true, revoked: false})
+                (map-set verified-users user 
+                    {proof: proof,
+                     timestamp: (default-to u0 current-time),
+                     expiry: expiry,
+                     status: true,
+                     level: level})
+                (unwrap-panic (update-reputation-score user SCORE-REGISTRATION true))
+                (unwrap-panic (log-audit-event user EVENT-REGISTRATION level "Batch registration"))
+                {success: (+ (get success acc) u1), fail: (get fail acc)})
+            {success: (get success acc), fail: (+ (get fail acc) u1)})))
+
+(define-public (batch-register-users (users (list 50 {user: principal, proof: (buff 64), expiry: uint, level: uint})))
+    (let ((batch-size (len users))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (batch-id (var-get batch-counter)))
+        (asserts! (> batch-size u0) ERR-BATCH-EMPTY)
+        (asserts! (<= batch-size MAX-BATCH-SIZE) ERR-BATCH-LIMIT-EXCEEDED)
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-verify (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (let ((result (fold process-single-registration users {success: u0, fail: u0})))
+            (var-set batch-counter (+ batch-id u1))
+            (map-set batch-operations batch-id
+                {operator: tx-sender,
+                 total-users: batch-size,
+                 successful: (get success result),
+                 failed: (get fail result),
+                 timestamp: (default-to u0 current-time)})
+            (ok result))))
+
+(define-private (process-single-revocation (user principal) (acc {success: uint, fail: uint}))
+    (let ((user-data (map-get? verified-users user)))
+        (if (is-some user-data)
+            (begin
+                (map-set verified-users user 
+                    (merge (unwrap-panic user-data) {status: false}))
+                (unwrap-panic (update-reputation-score user SCORE-REVOCATION-PENALTY false))
+                (unwrap-panic (log-audit-event user EVENT-REVOCATION (get level (unwrap-panic user-data)) "Batch revocation"))
+                {success: (+ (get success acc) u1), fail: (get fail acc)})
+            {success: (get success acc), fail: (+ (get fail acc) u1)})))
+
+(define-public (batch-revoke-users (users (list 50 principal)))
+    (let ((batch-size (len users))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (batch-id (var-get batch-counter)))
+        (asserts! (> batch-size u0) ERR-BATCH-EMPTY)
+        (asserts! (<= batch-size MAX-BATCH-SIZE) ERR-BATCH-LIMIT-EXCEEDED)
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-revoke (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (let ((result (fold process-single-revocation users {success: u0, fail: u0})))
+            (var-set batch-counter (+ batch-id u1))
+            (map-set batch-operations batch-id
+                {operator: tx-sender,
+                 total-users: batch-size,
+                 successful: (get success result),
+                 failed: (get fail result),
+                 timestamp: (default-to u0 current-time)})
+            (ok result))))
+
+(define-read-only (get-batch-operation (batch-id uint))
+    (ok (map-get? batch-operations batch-id)))
+
+(define-read-only (get-total-batches)
+    (ok (var-get batch-counter)))
 
