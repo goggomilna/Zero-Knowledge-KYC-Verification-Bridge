@@ -1,0 +1,365 @@
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-INVALID-PROOF (err u101))
+(define-constant ERR-ALREADY-VERIFIED (err u102))
+(define-constant ERR-NOT-VERIFIED (err u103))
+(define-constant ERR-EXPIRED (err u104))
+(define-constant ERR-REVOKED (err u105))
+(define-constant ERR-INVALID-EXPIRY (err u106))
+(define-constant ERR-INVALID-LEVEL (err u107))
+(define-constant ERR-INSUFFICIENT-LEVEL (err u108))
+(define-constant ERR-AUDIT-OVERFLOW (err u109))
+(define-constant ERR-INVALID-SCORE (err u110))
+(define-constant ERR-BATCH-LIMIT-EXCEEDED (err u111))
+(define-constant ERR-BATCH-EMPTY (err u112))
+
+(define-constant MAX-BATCH-SIZE u50)
+
+(define-constant EVENT-REGISTRATION u1)
+(define-constant EVENT-REVOCATION u2)
+(define-constant EVENT-UPDATE u3)
+(define-constant EVENT-LEVEL-CHECK u4)
+
+(define-constant LEVEL-BASIC u1)
+(define-constant LEVEL-STANDARD u2) 
+(define-constant LEVEL-PREMIUM u3)
+
+(define-constant SCORE-REGISTRATION u10)
+(define-constant SCORE-UPDATE u5)
+(define-constant SCORE-REVOCATION-PENALTY u20)
+(define-constant SCORE-EXPIRY-PENALTY u3)
+
+(define-data-var contract-owner principal tx-sender)
+(define-data-var oracle-address principal tx-sender)
+(define-data-var proof-threshold uint u5)
+(define-data-var audit-counter uint u0)
+
+(define-map verified-users 
+    principal 
+    {proof: (buff 64), 
+     timestamp: uint,
+     expiry: uint,
+     status: bool,
+     level: uint})
+
+(define-map oracle-proofs 
+    (buff 64) 
+    {verified: bool, 
+     revoked: bool})
+
+(define-map access-controls
+    principal 
+    {can-verify: bool,
+     can-revoke: bool})
+
+(define-map audit-logs
+    uint
+    {user: principal,
+     event-type: uint,
+     timestamp: uint,
+     operator: principal,
+     level: uint,
+     details: (string-ascii 256)})
+
+(define-map user-audit-count
+    principal
+    uint)
+
+(define-map user-reputation-scores
+    principal
+    {score: uint,
+     positive-actions: uint,
+     negative-actions: uint,
+     last-updated: uint})
+
+(define-map batch-operations
+    uint
+    {operator: principal,
+     total-users: uint,
+     successful: uint,
+     failed: uint,
+     timestamp: uint})
+
+(define-data-var batch-counter uint u0)
+
+(define-private (update-reputation-score (user principal) (points uint) (is-positive bool))
+    (let ((current-score (default-to {score: u0, positive-actions: u0, negative-actions: u0, last-updated: u0} 
+                                     (map-get? user-reputation-scores user)))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (if is-positive
+            (map-set user-reputation-scores user
+                {score: (+ (get score current-score) points),
+                 positive-actions: (+ (get positive-actions current-score) u1),
+                 negative-actions: (get negative-actions current-score),
+                 last-updated: (default-to u0 current-time)})
+            (map-set user-reputation-scores user
+                {score: (if (>= (get score current-score) points) 
+                           (- (get score current-score) points) 
+                           u0),
+                 positive-actions: (get positive-actions current-score),
+                 negative-actions: (+ (get negative-actions current-score) u1),
+                 last-updated: (default-to u0 current-time)}))
+        (ok true)))
+
+(define-private (log-audit-event (user principal) (event-type uint) (level uint) (details (string-ascii 256)))
+    (let ((current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (audit-id (var-get audit-counter))
+          (current-user-count (default-to u0 (map-get? user-audit-count user))))
+        (var-set audit-counter (+ audit-id u1))
+        (map-set user-audit-count user (+ current-user-count u1))
+        (map-set audit-logs audit-id
+            {user: user,
+             event-type: event-type,
+             timestamp: (default-to u0 current-time),
+             operator: tx-sender,
+             level: level,
+             details: details})
+        (ok audit-id)))
+
+(define-public (set-oracle-address (new-oracle principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set oracle-address new-oracle))))
+
+(define-public (update-proof-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set proof-threshold new-threshold))))
+
+(define-public (grant-access-control (operator principal) (can-verify bool) (can-revoke bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (map-set access-controls operator {can-verify: can-verify, can-revoke: can-revoke}))))
+
+(define-public (register-proof (user principal) (proof (buff 64)) (expiry uint) (verification-level uint))
+    (let ((current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-verify (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (asserts! (> expiry (default-to u0 current-time)) ERR-INVALID-EXPIRY)
+        (asserts! (is-none (map-get? verified-users user)) ERR-ALREADY-VERIFIED)
+        (asserts! (or (is-eq verification-level LEVEL-BASIC) 
+                      (or (is-eq verification-level LEVEL-STANDARD) 
+                          (is-eq verification-level LEVEL-PREMIUM))) ERR-INVALID-LEVEL)
+        (map-set oracle-proofs proof {verified: true, revoked: false})
+        (map-set verified-users user 
+            {proof: proof,
+             timestamp: (default-to u0 current-time),
+             expiry: expiry,
+             status: true,
+             level: verification-level})
+        (unwrap-panic (update-reputation-score user SCORE-REGISTRATION true))
+        (unwrap-panic (log-audit-event user EVENT-REGISTRATION verification-level "User registered with KYC verification"))
+        (ok true)))
+
+(define-public (verify-user-status (user principal))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (asserts! (get status (unwrap-panic user-data)) ERR-REVOKED)
+        (asserts! (> (get expiry (unwrap-panic user-data)) 
+            (default-to u0 current-time)) ERR-EXPIRED)
+        (ok true)))
+
+(define-public (revoke-verification (user principal))
+    (let ((user-data (map-get? verified-users user)))
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-revoke (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (map-set verified-users user 
+            (merge (unwrap-panic user-data) {status: false}))
+        (unwrap-panic (update-reputation-score user SCORE-REVOCATION-PENALTY false))
+        (unwrap-panic (log-audit-event user EVENT-REVOCATION (get level (unwrap-panic user-data)) "Verification status revoked"))
+        (ok true)))
+
+(define-public (update-verification (user principal) (new-proof (buff 64)) (new-expiry uint) (new-level uint))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-verify (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (asserts! (> new-expiry (default-to u0 current-time)) ERR-INVALID-EXPIRY)
+        (asserts! (or (is-eq new-level LEVEL-BASIC) 
+                      (or (is-eq new-level LEVEL-STANDARD) 
+                          (is-eq new-level LEVEL-PREMIUM))) ERR-INVALID-LEVEL)
+        (map-set oracle-proofs new-proof {verified: true, revoked: false})
+        (map-set verified-users user 
+            {proof: new-proof,
+             timestamp: (default-to u0 current-time),
+             expiry: new-expiry,
+             status: true,
+             level: new-level})
+        (unwrap-panic (update-reputation-score user SCORE-UPDATE true))
+        (unwrap-panic (log-audit-event user EVENT-UPDATE new-level "Verification details updated"))
+        (ok true)))
+
+(define-read-only (get-user-verification (user principal))
+    (ok (map-get? verified-users user)))
+
+(define-read-only (check-proof-validity (proof (buff 64)))
+    (ok (map-get? oracle-proofs proof)))
+
+(define-read-only (get-oracle)
+    (ok (var-get oracle-address)))
+
+(define-read-only (get-proof-threshold)
+    (ok (var-get proof-threshold)))
+
+(define-public (verify-minimum-level (user principal) (required-level uint))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (asserts! (get status (unwrap-panic user-data)) ERR-REVOKED)
+        (asserts! (> (get expiry (unwrap-panic user-data)) 
+            (default-to u0 current-time)) ERR-EXPIRED)
+        (asserts! (>= (get level (unwrap-panic user-data)) required-level) ERR-INSUFFICIENT-LEVEL)
+        (unwrap-panic (log-audit-event user EVENT-LEVEL-CHECK required-level "Level access verified"))
+        (ok true)))
+
+(define-read-only (get-user-level (user principal))
+    (let ((user-data (map-get? verified-users user)))
+        (match user-data
+            data (ok (some (get level data)))
+            (ok none))))
+
+(define-read-only (check-level-access (user principal) (required-level uint))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (match user-data
+            data (if (and (get status data)
+                         (> (get expiry data) (default-to u0 current-time))
+                         (>= (get level data) required-level))
+                     (ok true)
+                     (ok false))
+            (ok false))))
+
+(define-read-only (get-audit-log (audit-id uint))
+    (ok (map-get? audit-logs audit-id)))
+
+(define-read-only (get-user-audit-count (user principal))
+    (ok (default-to u0 (map-get? user-audit-count user))))
+
+(define-read-only (get-total-audit-count)
+    (ok (var-get audit-counter)))
+
+(define-read-only (get-audit-logs-by-range (start-id uint) (end-id uint))
+    (let ((current-counter (var-get audit-counter)))
+        (if (and (<= start-id end-id) (< end-id current-counter))
+            (ok {start: start-id, end: end-id, total: current-counter})
+            (ok {start: u0, end: u0, total: current-counter}))))
+
+(define-read-only (get-audit-logs-by-user-range (user principal) (start-timestamp uint) (end-timestamp uint))
+    (let ((user-count (default-to u0 (map-get? user-audit-count user))))
+        (ok {user: user, count: user-count, start: start-timestamp, end: end-timestamp})))
+
+(define-read-only (get-reputation-score (user principal))
+    (ok (map-get? user-reputation-scores user)))
+
+(define-read-only (check-reputation-threshold (user principal) (minimum-score uint))
+    (let ((reputation-data (map-get? user-reputation-scores user)))
+        (match reputation-data
+            data (ok (>= (get score data) minimum-score))
+            (ok false))))
+
+(define-public (penalize-expired-verification (user principal))
+    (let ((user-data (map-get? verified-users user))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1))))
+        (asserts! (is-some user-data) ERR-NOT-VERIFIED)
+        (asserts! (get status (unwrap-panic user-data)) ERR-REVOKED)
+        (asserts! (<= (get expiry (unwrap-panic user-data)) 
+            (default-to u0 current-time)) ERR-INVALID-EXPIRY)
+        (unwrap-panic (update-reputation-score user SCORE-EXPIRY-PENALTY false))
+        (ok true)))
+
+(define-read-only (get-reputation-ranking (user principal))
+    (let ((reputation-data (default-to {score: u0, positive-actions: u0, negative-actions: u0, last-updated: u0} 
+                                       (map-get? user-reputation-scores user)))
+          (score (get score reputation-data)))
+        (ok (if (>= score u100)
+               "excellent"
+               (if (>= score u50)
+                   "good"
+                   (if (>= score u20)
+                       "average"
+                       "low"))))))
+
+(define-private (process-single-registration (user-entry {user: principal, proof: (buff 64), expiry: uint, level: uint}) (acc {success: uint, fail: uint}))
+    (let ((current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (user (get user user-entry))
+          (proof (get proof user-entry))
+          (expiry (get expiry user-entry))
+          (level (get level user-entry)))
+        (if (and (> expiry (default-to u0 current-time))
+                (is-none (map-get? verified-users user))
+                (or (is-eq level LEVEL-BASIC) 
+                    (or (is-eq level LEVEL-STANDARD) 
+                        (is-eq level LEVEL-PREMIUM))))
+            (begin
+                (map-set oracle-proofs proof {verified: true, revoked: false})
+                (map-set verified-users user 
+                    {proof: proof,
+                     timestamp: (default-to u0 current-time),
+                     expiry: expiry,
+                     status: true,
+                     level: level})
+                (unwrap-panic (update-reputation-score user SCORE-REGISTRATION true))
+                (unwrap-panic (log-audit-event user EVENT-REGISTRATION level "Batch registration"))
+                {success: (+ (get success acc) u1), fail: (get fail acc)})
+            {success: (get success acc), fail: (+ (get fail acc) u1)})))
+
+(define-public (batch-register-users (users (list 50 {user: principal, proof: (buff 64), expiry: uint, level: uint})))
+    (let ((batch-size (len users))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (batch-id (var-get batch-counter)))
+        (asserts! (> batch-size u0) ERR-BATCH-EMPTY)
+        (asserts! (<= batch-size MAX-BATCH-SIZE) ERR-BATCH-LIMIT-EXCEEDED)
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-verify (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (let ((result (fold process-single-registration users {success: u0, fail: u0})))
+            (var-set batch-counter (+ batch-id u1))
+            (map-set batch-operations batch-id
+                {operator: tx-sender,
+                 total-users: batch-size,
+                 successful: (get success result),
+                 failed: (get fail result),
+                 timestamp: (default-to u0 current-time)})
+            (ok result))))
+
+(define-private (process-single-revocation (user principal) (acc {success: uint, fail: uint}))
+    (let ((user-data (map-get? verified-users user)))
+        (if (is-some user-data)
+            (begin
+                (map-set verified-users user 
+                    (merge (unwrap-panic user-data) {status: false}))
+                (unwrap-panic (update-reputation-score user SCORE-REVOCATION-PENALTY false))
+                (unwrap-panic (log-audit-event user EVENT-REVOCATION (get level (unwrap-panic user-data)) "Batch revocation"))
+                {success: (+ (get success acc) u1), fail: (get fail acc)})
+            {success: (get success acc), fail: (+ (get fail acc) u1)})))
+
+(define-public (batch-revoke-users (users (list 50 principal)))
+    (let ((batch-size (len users))
+          (current-time (get-stacks-block-info? time (- stacks-block-height u1)))
+          (batch-id (var-get batch-counter)))
+        (asserts! (> batch-size u0) ERR-BATCH-EMPTY)
+        (asserts! (<= batch-size MAX-BATCH-SIZE) ERR-BATCH-LIMIT-EXCEEDED)
+        (asserts! (is-some (map-get? access-controls tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-revoke (default-to {can-verify: false, can-revoke: false} 
+            (map-get? access-controls tx-sender))) ERR-NOT-AUTHORIZED)
+        (let ((result (fold process-single-revocation users {success: u0, fail: u0})))
+            (var-set batch-counter (+ batch-id u1))
+            (map-set batch-operations batch-id
+                {operator: tx-sender,
+                 total-users: batch-size,
+                 successful: (get success result),
+                 failed: (get fail result),
+                 timestamp: (default-to u0 current-time)})
+            (ok result))))
+
+(define-read-only (get-batch-operation (batch-id uint))
+    (ok (map-get? batch-operations batch-id)))
+
+(define-read-only (get-total-batches)
+    (ok (var-get batch-counter)))
+
